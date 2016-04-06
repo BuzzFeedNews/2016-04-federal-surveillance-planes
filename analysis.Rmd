@@ -1,0 +1,905 @@
+---
+title: "Spies In The Skies"
+output: html_document
+---
+
+Data and [R](https://www.r-project.org/) code for the analysis supporting this [April 6, 2016 BuzzFeed News post](https://www.buzzfeed.com/peteraldhous/spies-in-the-skies) on federal surveillance aircraft. Supporting files are in [this GitHub repository](https://github.com/BuzzFeedNews/2016-04-federal-surveillance-planes).
+
+## Data preparation
+
+BuzzFeed News obtained more than four months of aircraft transponder detections from the plane tracking website [Flightradar24](https://www.flightradar24.com), covering August 17 to December 31, 2015 [UTC](http://www.timeanddate.com/time/aboututc.html), containing all data displayed on the site within a bounding box encompassing the continental United States, Alaska, Hawaii and Puerto Rico. Fightradar24 receives data from its network of ground-based receivers, supplemented by a feed from ground radars provided by the Federal Aviation Administration (FAA) with a five-minute delay.
+
+After parsing from the raw files supplied by Flightradar24, the data included the following fields, for each transponder detection:
+
+- `adshex` Unique identifier for each aircraft, corresponding to its "[Mode-S](http://www.skybrary.aero/index.php/Mode_S)" code, in hexademical format.
+- `flight_id` Unique identifier for each "flight segment," in hexadecimal format. A flight segment is a continuous series of transponder detections for one aircraft. There may be more than one segment per flight, if a plane disappears from Flightradar24's coverage for a period --- for example when flying over rural areas with sparse receiver coverage. While being tracked by Fightradar24, surveillance planes were typically detected several times per minute.
+- `latitude`, `longitude` Geographic location in digital degrees.
+- `altitude` Altitude in feet.
+- `speed` Ground speed in knots.
+- `track` Compass bearing in degrees, with 0 corresponding to north.
+- `squawk` Four-digit code transmitted by the transponder.
+- `type` Aircraft model, if identified.
+- `timestamp` Full UTC timestamp.
+
+We saved the data for each individual plane in a separate comma-separated values (CSV) file, named for the aircraft's `adshex` Mode-S code.
+
+From the FAA [registration database](http://www.faa.gov/licenses_certificates/aircraft_certification/aircraft_registry/releasable_aircraft_download/), we identified aircraft registered to the Department of Homeland Security and companies previously identified as front operations for the FBI. Using the Mode-S hexadecimal codes for these planes, we imported the corresponding files from the Flightradar24 data into R, and joined this to the FAA data to give the following additional fields:
+
+- `name` Name of aircraft registrant.
+- `other_names1`, `other_names2` Other names for the registrant, if listed.
+- `n_number` Aircraft [registration number](http://www.faa.gov/licenses_certificates/aircraft_certification/aircraft_registry/forming_nnumber/), sometimes called a "tail number." For U.S.-registered planes, these begin with the letter "N," followed by up to five alphanumeric characters.
+- `serial_number` Identifying number assigned to the aircraft by its manufacturer.
+- `mfr_mdl_code` Code designating the manufacturer and model of the aircraft.
+- `mfr` Manufacturer.
+- `model` Aircraft model.
+- `year_mfr` Year in which aircraft was manufactured.
+- `type_aircraft` `4`: fixed-wing single-engine, `5`: fixed-wing multi-engine, `6`: helicopter.
+- `agency` Federal agency operating the aircraft, recorded by BuzzFeed News.
+
+This data is spread across three files `feds1.csv`, `feds2.csv`, and `feds3.csv`, to keep file sizes small, which we then processed to create further calculated fields.
+
+```{r knitr_options, include=FALSE}
+library(knitr)
+opts_chunk$set(out.width="970px", dpi=300)
+```
+
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# load required packages
+library(readr)
+library(dplyr)
+
+# Set default timezone for session to UTC
+Sys.setenv(TZ = "UTC")
+
+# create data frame
+feds <- data_frame()
+
+# list files to load
+files <- list.files("data/feds")
+
+# load data
+for (file in files) {
+    tmp <- read_csv(paste0("data/feds/",file), col_types = list(
+      adshex = col_character(),
+      flight_id = col_character(),
+      latitude = col_double(),
+      longitude = col_double(),
+      altitude = col_integer(),
+      speed = col_integer(),
+      squawk = col_character(),
+      type = col_character(),
+      timestamp = col_datetime(),
+      name = col_character(),
+      other_names1 = col_character(),
+      other_names2 = col_character(),
+      n_number = col_character(),
+      serial_number = col_character(),
+      mfr_mdl_code = col_character(),
+      mfr = col_character(),
+      model = col_character(),
+      year_mfr = col_integer(),
+      type_aircraft = col_integer(),
+      agency = col_character()
+    ))
+    feds <- bind_rows(feds,tmp)
+}
+rm(tmp,file)
+```
+
+First, we created a new field `loc_timestamp`, converting the UTC timestamps to local standard times.
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# load required packages
+library(rgdal)
+library(rgeos)
+
+# load Natural Earth timezones shapefile
+timezones <- readOGR("data/ne_10m_time_zones", "ne_10m_time_zones")
+```
+
+```{r}
+# what is its Coordinate Reference System (CRS)?
+timezones@proj4string
+```
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# convert the feds data to a spatial points data frame, with the same CRS
+feds_map <- as.data.frame(feds)
+xy <- feds_map[,c(4,3)]
+feds_map <- SpatialPointsDataFrame(coords = xy, data = feds_map, proj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+
+# spatial join of timezone data to feds_map (this will take some time to run)
+feds_map <- raster::intersect(feds_map, timezones)
+
+# function to use when adding/subtracting hours from datetime objects
+hrs <- function(x) {
+  y <- x * 3600
+  return(y)
+}
+
+# create loc_timestamp field, and drop the fields added in the spatial join
+# zone is the field that gives the offset from UTC in hours
+feds <- as.data.frame(feds_map) %>%
+  mutate(loc_timestamp = timestamp + hrs(zone)) %>%
+  select(1:21,loc_timestamp)
+  
+```
+
+We then created further fields from `loc_timestamp`, giving date, day of the week, hour on the 24-hour clock, and designating each day as a regular working day, or not (for weekends and federal holidays).  
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# create date, day_week, and hour fields
+feds <- feds %>%
+  mutate(date = as.Date(loc_timestamp),
+         day_week = weekdays(loc_timestamp),
+         hour = as.numeric(format(loc_timestamp, "%H")))
+
+# create work_day field
+feds_weekends <- feds %>%
+  filter(day_week == "Saturday" | day_week == "Sunday") %>%
+  mutate(work_day = "N")
+
+hols <- as.data.frame(as.Date(c("2015-09-07","2015-10-12","2015-11-11","2015-11-26","2015-12-25")))
+names(hols) <- "date"
+
+feds_hols <- inner_join(feds, hols) %>%
+  mutate(work_day = "N")
+
+feds_working <- feds %>%
+  filter(day_week != "Saturday" & day_week != "Sunday") %>%
+  anti_join(hols) %>%
+  mutate(work_day = "Y")
+
+feds <- bind_rows(feds_weekends, feds_hols, feds_working)
+```
+
+The `feds` data frame now contained the following additional fields:
+
+- `loc_timestamp` Full timestamp in local standard time.
+- `date` Date, based on local timestamp.
+- `day_week` Day of the week, based on local timestamp.
+- `hour` Hour on the 24-hour clock, based on local timestamp.
+- `work_day` `Y` for a regular working day, `N` for weekends and federal holidays, based on local timestamp.
+
+Registration documents obtained from the FAA revealed that the ownership of two helicopters was transferred from the DHS to an FBI front company in mid-December, so we corrected earlier records to reflect this switch.
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# correcting ownership records for aircraft that switched registration from DHS to FBI
+transfers <- feds %>%
+  filter(date < "2015-12-14" & (n_number == "6971A" | n_number == "6982A"))
+feds <- anti_join(feds, transfers)
+transfers <- transfers %>%
+  mutate(name = "DEPARTMENT OF HOMELAND SECURITY", agency = "dhs")
+feds <- bind_rows(feds, transfers)
+```
+
+We performed a spatial join to the boundaries of U.S. states and territories, for analysis of the data by state, and to restrict calculations to planes observed over U.S. states and territories.
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# load states/provinces shapefile
+states <- readOGR("data/ne_10m_admin_1_states_provinces", "ne_10m_admin_1_states_provinces")
+
+# filter for US states/territories only
+states <- states [ which(states@data$sov_a3 == "US1"), ]
+```
+
+```{r}
+# what is its CRS?
+states@proj4string
+```
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# convert the feds data to a spatial points data frame, with the same CRS
+feds_map <- as.data.frame(feds)
+xy <- feds_map[,c(4,3)]
+feds_map <- SpatialPointsDataFrame(coords = xy, data = feds_map, proj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+
+# spatial join of states to feds_map (this will take some time to run)
+states_feds_map <- raster::intersect(feds_map, states) 
+
+# convert to data frame, and drop fields from the spatial join apart from state/territory name and abbreviation
+states_feds <- as.data.frame(states_feds_map) %>%
+  select(1:26, name.1, postal) %>%
+  rename(state = name.1)
+```
+
+And we performed a spatial join to the boundaries of [urban areas](https://www.census.gov/geo/reference/ua/uafaq.html) defined by the Census Bureau. This allowed subsquent analysis for transponder detections over any urban area.
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# load urban areas shapefile
+urban <-  readOGR("data/cb_2014_us_ua10_500k", "cb_2014_us_ua10_500k") 
+```
+```{r}
+# what is its CRS?
+urban@proj4string
+```
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# convert the feds data to a spatial points data frame, with the same CRS
+feds_map <- as.data.frame(feds)
+xy <- feds_map[,c(4,3)]
+feds_map <- SpatialPointsDataFrame(coords = xy, data = feds_map, proj4string = CRS("+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"))
+
+# spatial join of urban to feds_map (this will take some time to run)
+# note use of spatialEco package function here, rather than raster package function used above, which crashed on this spatial join
+urban_feds_map <- spatialEco::point.in.poly(feds_map, urban) 
+
+# convert to data frame, and drop some fields from the spatial join
+urban_feds <- as.data.frame(urban_feds_map) %>%
+  select(1:26,29,30)
+```
+
+The `urban_feds` data frame now contained the following additional fields:
+
+- `GEOID10` Five-digit identifying code for each urban area.
+- `NAME10` Name of each urban area.
+
+We then filtered to remove data for `2015-08-16` and `2015-12-31`, which will be incomplete after conversion to local times from UTC.
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# filter to remove dates with incomplete data
+feds_series <- feds %>%
+  filter(date != as.Date("2015-08-16") & date != as.Date("2015-12-31"))
+urban_feds_series <- urban_feds %>%
+  filter(date != as.Date("2015-08-16") & date != as.Date("2015-12-31"))
+states_feds_series <- states_feds %>%
+  filter(date != as.Date("2015-08-16") & date != as.Date("2015-12-31"))
+```
+
+## Analysis
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# load required packages
+library(DT)
+library(ggplot2)
+library(scales)
+library(tidyr)
+```
+
+### Aircraft detected, by agency and major type
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# Count aircraft for each agency, fixed-wing and helicopters
+feds_types <- states_feds_series %>%
+  mutate(type_aircraft = paste0("type", type_aircraft)) %>%
+  group_by(agency, type_aircraft) %>%
+  summarise(count = n_distinct(adshex)) %>%
+  spread(type_aircraft, count)
+feds_types[is.na(feds_types)] <- 0
+feds_types <- feds_types %>%
+  mutate("Fixed-wing" = type4 + type5,
+         Helicopters = type2 + type6,
+         Agency = toupper(agency)) %>%
+  select(8,6,7)
+# DHS count includes 5 helicopters incorrectly classified in the FAA registration database as balloons (type_aircraft==2), fixed in the code above
+```
+
+***
+
+#### Number of aircraft, by agency
+```{r, echo=FALSE}
+datatable(feds_types,  rownames = FALSE, 
+          options = list(dom = "t",
+                         columnDefs = list(list(className = "dt-center", targets = c(0:2)))))
+```
+(Includes two helicopters registered to the DHS until mid-December 2015, then transferred to an FBI front company, counted here under both agencies.)
+
+***
+
+### Total number of flights and flight segments
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# how many flight segments? How many days active for each plane?
+feds_flights <- states_feds_series %>%
+  group_by(agency, adshex) %>%
+  summarise(flights = n_distinct(flight_id), days = n_distinct(date))
+
+total_days <- feds_flights %>%
+  ungroup() %>%
+  group_by(agency) %>%
+  summarise(flights = sum(flights),days = sum(days)) %>%
+  mutate(agency = toupper(agency),
+         flights = format(flights, big.mark = ","),
+         days=format(days, big.mark = ","))
+  
+names(total_days) <- c("Agency","Flight segments","Minimum flights")
+```
+
+
+***
+
+#### Number of flights, by agency
+```{r, echo=FALSE}
+datatable(total_days,  rownames = FALSE, 
+          options = list(dom = "t",
+                         columnDefs = list(list(className = "dt-center", targets = c(0:2)))))
+```
+In the Flightradar24 data, there may be more than one flight segment within a flight, if a plane disappears from coverage for a period. In this table, "Minimum flights" is a count of distinct aircraft/date combinations, and is a conservative estimate of the total number of flights.
+
+***
+
+### All detected aircraft
+```{r, results="hide", warning=FALSE, message=FALSE}
+# count transponder detections by plane
+all_planes <- states_feds_series %>%
+  group_by(agency, n_number, mfr, model, type_aircraft) %>%
+  summarise(count = n())
+all_helicopters <- all_planes %>%
+  filter(type_aircraft == 2 | type_aircraft == 6) %>%
+  mutate(type = "Helicopter")
+all_fixed <- all_planes %>%
+  filter(type_aircraft == 4 | type_aircraft == 5) %>%
+  mutate(type = "Fixed-wing")
+all_planes <- bind_rows(all_helicopters, all_fixed) %>%
+  arrange(desc(count)) %>%
+  ungroup() %>%
+  mutate(agency = toupper(agency),
+         count = format(count, big.mark = ",")) %>%
+  select(1:4,7,6)
+names(all_planes) <- c("Agency","Registration","Manufacturer","Model","Type","Transponder detections")
+```
+
+***
+
+#### Transponder detections, by aircraft
+```{r, echo=FALSE}
+datatable(all_planes, rownames = FALSE, 
+          options = list(columnDefs = list(list(className = "dt-center", targets = c(0:5)))))
+```
+
+***
+### Total planes and transponder detections, by state
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# for FBI aircraft
+states_fbi <- states_feds_series %>%
+  filter(agency == "fbi") %>%
+  group_by(state, postal) %>%
+  summarise(planes = n_distinct(adshex), detections = n()) %>%
+  ungroup() %>%
+  arrange(desc(detections)) %>%
+  mutate(detections = format(detections, big.mark = ","))
+names(states_fbi) <- c("State/territory","Abbrev.","Planes","Transponder detections")
+```
+
+***
+
+#### FBI surveillance, by state
+```{r, echo=FALSE}
+datatable(states_fbi, rownames = FALSE,
+          options = list(columnDefs = list(list(className = "dt-center", targets = c(0:3)))))
+```
+
+***
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# for dhs aircraft
+states_dhs <- states_feds_series %>%
+  filter(agency == "dhs") %>%
+  group_by(state, postal) %>%
+  summarise(planes = n_distinct(adshex), detections = n()) %>%
+  ungroup() %>%
+  arrange(desc(detections)) %>%
+  mutate(detections = format(detections, big.mark=","))
+names(states_dhs) <- c("State/territory","Abbrev.","Planes","Transponder detections")
+```
+
+***
+
+#### DHS surveillance, by state
+```{r, echo=FALSE}
+datatable(states_dhs, rownames = FALSE,
+          options = list(columnDefs = list(list(className = "dt-center", targets = c(0:3)))))
+```
+
+***
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# combined fbi and dhs aircraft
+states_combined <- states_feds_series %>%
+  group_by(state,postal) %>%
+  summarise(planes = n_distinct(adshex), detections = n()) %>%
+  ungroup() %>%
+  arrange(desc(detections)) %>%
+  mutate(detections=format(detections, big.mark = ","))
+names(states_combined) <- c("State/territory","Abbrev.","Planes","Transponder detections")
+```
+
+***
+
+#### Combined FBI and DHS surveillance, by state
+```{r, echo=FALSE}
+datatable(states_combined, rownames = FALSE,
+          options = list(columnDefs = list(list(className = "dt-center", targets = c(0:3)))))
+```
+
+***
+
+FBI or DHS aircraft were detected at least fleetingly over every U.S. state, plus Washington DC and Puerto Rico --- apart from Montana.
+
+### FBI and DHS surveillance by hour of the day
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# count transponder detections per hour
+feds_hours <- states_feds_series %>%
+  group_by(agency, hour) %>%
+  summarise(observations = n()) %>%
+  filter(agency == "fbi" | agency == "dhs")
+
+# plot
+hours <- ggplot(feds_hours, aes(x=hour, y=observations, color = agency)) %>%
+  + geom_line(size = 0.7) %>%
+  + geom_point(size = 1.5) %>%
+  + xlab("Hour (24-hour clock)") %>%
+  + ylab("Total transponder detections") %>%
+  + theme_minimal() %>%
+  + scale_color_manual(values = c("#0F3B82", "#FF2900"),
+                       labels = c("DHS", "FBI")) %>%
+  + scale_y_continuous(labels = comma) %>%
+  + theme(legend.position = "top",
+          legend.title = element_blank())
+```
+
+***
+
+#### FBI and DHS transponder detections, by hour of the day
+```{r, echo=FALSE}
+plot(hours)
+```
+
+***
+
+### FBI and DHS surveillance on working vs. non-working days
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# planes flying per day, working vs non-working days
+# note, there were no days with zero flights
+planes_work_v_non <- states_feds_series %>%
+  group_by(work_day, date, agency) %>%
+  summarise(count = mean(n_distinct(adshex))) %>%
+  group_by(work_day, agency) %>%
+  summarise(working_average = round(mean(count),2)) %>%
+  spread(work_day, working_average) %>%
+  mutate(pc_reduction = round(100-(N/Y*100),2),
+         agency = toupper(agency)) %>%
+  select(1,3,2,4)
+names(planes_work_v_non) <- c("Agency","Working days","Non-working days","% reduction")
+```
+
+***
+
+#### Planes per day
+```{r, echo=FALSE}
+datatable(planes_work_v_non, rownames = FALSE,
+          options = list(dom = "t",
+                         columnDefs = list(list(className = "dt-center", targets = c(0:3)))))
+```
+
+***
+
+```{r, results="hide"}
+# transponder detections per day, working vs non-working days
+obs_work_v_non <- states_feds_series %>%
+  group_by(work_day, date, agency) %>%
+  summarise(count = n()) %>%
+  group_by(work_day, agency) %>%
+  summarise(working_average = round(mean(count))) %>%
+  spread(work_day, working_average) %>%
+  mutate(pc_reduction = round(100-(N/Y*100),1),
+         agency = toupper(agency),
+         Y = format(Y, big.mark = ","),
+         N = format(N, big.mark = ",")) %>%
+  select(1,3,2,4)
+names(obs_work_v_non) <- c("Agency","Working days","Non-working days","% reduction")
+```
+
+***
+
+#### Transponder detections per day
+```{r, echo=FALSE}
+datatable(obs_work_v_non, rownames=FALSE,
+          options = list(dom = "t",
+                         columnDefs = list(list(className = "dt-center", targets = c(0:3)))))
+```
+
+***
+
+#### Flight time per day
+```{r, results="hide"}
+# flight time per day, working vs non-working days
+
+# first calculate number of working and non-working days
+work_days <- states_feds_series %>%
+  group_by(work_day) %>%
+  summarise(count = n_distinct(date))
+# there were 93 working days and 43 non-working days
+
+time_work_v_non <- states_feds_series %>%
+  group_by(work_day, date, agency, flight_id) %>%
+  summarise(duration = as.numeric(difftime(max(timestamp), min(timestamp), units = "hours"))) %>%
+  group_by(work_day, agency) %>%
+  summarise(total = sum(duration)) %>%
+  spread(work_day, total) %>%
+  mutate(N = round(N/43, 1), Y = round(Y/93, 1)) %>%
+  mutate(pc_reduction = round(100 - (N/Y*100), 1),
+         agency = toupper(agency),
+         Y = format(Y, big.mark = ","),
+         N = format(N, big.mark = ",")) %>%
+  select(1,3,2,4)
+names(time_work_v_non) <- c("Agency","Working days","Non-working days","% reduction")
+```
+
+***
+
+#### Detected flight hours per day
+```{r, echo=FALSE}
+datatable(time_work_v_non, rownames=FALSE,
+          options = list(dom = "t",
+                         columnDefs = list(list(className = "dt-center", targets = c(0:3)))))
+```
+
+***
+
+### FBI and DHS surveillance by day of the week (not including federal holidays)
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+obs_weekdays <- anti_join(states_feds_series, feds_hols) %>%
+  group_by(agency, day_week) %>%
+  summarise(count = n()) %>%
+  ungroup() %>%
+  mutate(agency = toupper(agency))
+
+# convert week_day to an ordered factor
+obs_weekdays$day_week <- factor(obs_weekdays$day_week, levels = c("Sunday", "Monday", 
+    "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"))
+obs_weekdays[order(obs_weekdays$day_week), ]
+
+# plot
+daily <- ggplot(obs_weekdays, aes(x = day_week, y = count, fill = agency)) %>%
+  + geom_bar(stat = "identity") %>%
+  + theme_minimal() %>%
+  + ylab("Total transponder detections") %>%
+  + xlab("") %>%
+  + scale_fill_manual(values = c("#0F3B82", "#FF2900")) %>%
+  + scale_y_continuous(labels = comma) %>%
+  + scale_x_discrete(labels = c("Sun", "Mon", 
+    "Tues", "Weds", "Thurs", "Fri", "Sat")) %>%
+  + theme(legend.position = "none",
+          panel.grid.major.x = element_blank()) %>%
+  + facet_wrap(~agency)
+```
+
+***
+
+#### DHS and FBI transponder detections, by weekday
+
+```{r, echo=FALSE}
+plot(daily)   
+```
+
+***
+
+### Full timelines of FBI and DHS surveillance activity
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# data frame to highlight weekends on charts
+start <- c("2015-08-22","2015-08-29","2015-09-05","2015-09-12","2015-09-19","2015-09-26","2015-10-03","2015-10-10","2015-10-17","2015-10-24","2015-10-31","2015-11-07","2015-11-14","2015-11-21","2015-11-28","2015-12-05","2015-12-12","2015-12-19","2015-12-26")
+end <- c("2015-08-24","2015-08-31","2015-09-07","2015-09-14","2015-09-21","2015-09-28","2015-10-05","2015-10-12","2015-10-19","2015-10-26","2015-11-02","2015-11-09","2015-11-16","2015-11-23","2015-11-30","2015-12-07","2015-12-14","2015-12-21","2015-12-28")
+weekends <- data_frame(start = as.POSIXct(start), end = as.POSIXct(end))
+
+# data frame to highlight federal holidays on charts
+start <- c("2015-09-07","2015-10-12","2015-11-11","2015-11-26","2015-12-25")
+end <- c("2015-09-08","2015-10-13","2015-11-12","2015-11-27","2015-12-26")
+fed_holidays <- data_frame(start = as.POSIXct(start), end = as.POSIXct(end))
+```
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# count planes, by agency and day
+planes_daily <- states_feds_series %>%
+  group_by(agency, date) %>%
+  summarise(count = n_distinct(adshex)) %>%
+  spread(date, count)
+planes_daily[is.na(planes_daily)] <- 0
+planes_daily <- planes_daily %>%
+  gather(date, count, -agency) %>%
+  mutate(date = as.POSIXct(date) + hrs(12)) # 12-hour offset will plot daily counts at 12 noon on each day
+
+# plot timeline
+planes_timeline <- ggplot() %>%
+  + geom_rect(aes(xmin = start, xmax = end),
+               ymin = 0, ymax = 40, fill="#cccccc", alpha = 0.4, data = weekends) %>%
+  + geom_rect(aes(xmin = start, xmax = end),
+               ymin = 0, ymax = 40, fill = "#cccccc", alpha = 0.4, data = fed_holidays) %>%
+  + geom_line(aes(x = date, y = count, color = agency), data = planes_daily, size = 0.3) %>%
+  + geom_point(aes(x = date, y = count, color = agency), data = planes_daily, size = 1) %>%
+  + geom_vline(xintercept = as.numeric(as.POSIXct("2015-12-02")), linetype = 3) %>%
+  + geom_vline(xintercept = as.numeric(as.POSIXct("2015-11-13")), linetype = 3) %>%
+  + xlab("Date (weekends/holidays marked in gray)") %>%
+  + ylab("Planes flying per day") %>%
+  + theme_minimal() %>%
+  + scale_color_manual(values=c("#0F3B82","#FF2900"),
+                       labels=c("DHS", "FBI")) %>%
+  + theme(legend.position = "top",
+          legend.title = element_blank()) %>%
+  + annotate("text", x = as.POSIXct("2015-12-02"), y = 39, label = "San Bernardino") %>%
+  + annotate("text", x = as.POSIXct("2015-11-13"), y = 39, label = "Paris") %>%
+  + annotate("text", x = as.POSIXct("2015-11-26T12:00:00Z"), y = 30, angle = 90, label = "Thanksgiving") %>%
+  + annotate("text", x = as.POSIXct("2015-12-26T00:00:00Z"), y = 30, angle = 90, label = "Christmas")
+  
+```
+
+***
+
+#### Planes per day
+```{r, echo=FALSE}
+plot(planes_timeline)
+```
+
+***
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# count transponder detections, by agency and day
+obs_daily <- states_feds_series %>%
+  group_by(agency, date) %>%
+  summarise(count = n()) %>%
+  spread(date, count)
+obs_daily[is.na(obs_daily)] <- 0
+obs_daily <- obs_daily %>%
+  gather(date, count, -agency) %>%
+  mutate(date = as.POSIXct(date) + hrs(12)) # 12-hour offset will plot daily counts at 12 noon on each day
+
+# plot timeline
+obs_timeline <- ggplot() %>%
+  + geom_rect(aes(xmin = start, xmax = end),
+               ymin = 0, ymax = 20000, fill = "#cccccc", alpha = 0.4, data = weekends) %>%
+  + geom_rect(aes(xmin=start, xmax=end),
+               ymin = 0, ymax = 20000, fill= "#cccccc", alpha = 0.4, data = fed_holidays) %>%
+  + geom_line(aes(x = date, y = count, color = agency), data = obs_daily, size = 0.3) %>%
+  + geom_point(aes(x = date, y = count, color = agency), data = obs_daily, size = 1) %>%
+  + geom_vline(xintercept = as.numeric(as.POSIXct("2015-12-02")), linetype = 3) %>%
+  + geom_vline(xintercept = as.numeric(as.POSIXct("2015-11-13")), linetype = 3) %>%
+  + xlab("Date (weekends/holidays marked in gray)") %>%
+  + ylab("Transponder detections per day") %>%
+  + theme_minimal() %>%
+  + scale_color_manual(values = c("#0F3B82","#FF2900"),
+                       labels = c("DHS", "FBI")) %>%
+  + scale_y_continuous(labels = comma) %>%
+  + theme(legend.position = "top",
+          legend.title = element_blank()) %>%
+  + annotate("text", x = as.POSIXct("2015-12-02"), y = 20000, label = "San Bernardino") %>%
+  + annotate("text", x = as.POSIXct("2015-11-13"), y = 20000, label = "Paris") %>%
+  + annotate("text", x = as.POSIXct("2015-11-26T12:00:00Z"), y = 15000, angle = 90, label = "Thanksgiving") %>%
+  + annotate("text", x = as.POSIXct("2015-12-26T00:00:00Z"), y = 15000, angle = 90, label = "Christmas")
+
+```
+
+***
+
+#### Transponder detections per day
+
+```{r, echo=FALSE}
+plot(obs_timeline)
+```
+
+***
+
+### On which days was surveillance least intensive?
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+
+# reshape daily plane counts, and calculate combined DHS and FBI total
+planes_daily2 <- planes_daily %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(count) %>%
+  spread(agency, count) %>%
+  mutate(combined = dhs + fbi,
+         date = format(date, "%b %d, %Y")) %>%
+  arrange(combined)
+names(planes_daily2) <- c("Date","DHS","FBI","Combined")
+```
+
+***
+
+#### Planes per day
+
+```{r, echo=FALSE}
+datatable(planes_daily2, rownames = FALSE,
+          options = list(columnDefs = list(list(className = "dt-center", targets = c(0:3)))))
+```
+
+***
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# reshape daily transponder detections, and calculate combined DHS and FBI total
+obs_daily2 <- obs_daily %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(count) %>%
+  spread(agency, count) %>%
+  mutate(combined = dhs + fbi,
+         date = format(date, "%b %d, %Y"),
+         dhs = format(dhs, big.mark = ","),
+         fbi = format(fbi, big.mark = ","),
+         combined = format(combined, big.mark = ",")) %>%
+  arrange(combined)
+names(obs_daily2) <- c("Date","DHS","FBI","Combined")
+```
+
+***
+
+#### Transponder detections per day
+```{r, echo=FALSE}
+datatable(obs_daily2, rownames = FALSE,
+          options = list(columnDefs = list(list(className = "dt-center", targets = c(0:3)))))
+```
+
+***
+
+### Timelines for urban areas in Southern California, before and after San Bernadino attack
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+
+# data frame with all dates
+dates <- urban_feds_series %>%
+  select(date) %>%
+  unique()
+
+# Riverside-San Bernadino
+san_bern_dhs <- urban_feds_series %>%
+  filter(NAME10 == "Riverside--San Bernardino, CA" & agency == "dhs") %>%
+  group_by(agency, date) %>%
+  summarise(count = n()) %>%
+  right_join(dates) %>%
+  ungroup() %>%
+  mutate(agency = "dhs")
+san_bern_fbi <- urban_feds_series %>%
+  filter(NAME10 == "Riverside--San Bernardino, CA" & agency == "fbi") %>%
+  group_by(agency, date) %>%
+  summarise(count = n()) %>%
+  right_join(dates) %>%
+  ungroup() %>%
+  mutate(agency = "fbi")
+san_bern <- bind_rows(san_bern_dhs,san_bern_fbi) %>%
+  mutate(date = as.POSIXct(date) + hrs(12)) # 12-hour offset will plot daily counts at 12 noon on each day
+san_bern[is.na(san_bern)] <- 0
+
+# plot timeline
+san_bern_timeline <- ggplot() %>%
+  + geom_rect(aes(xmin = start, xmax = end),
+               ymin = 0, ymax = 1300, fill = "#cccccc", alpha = 0.4, data = weekends) %>%
+  + geom_rect(aes(xmin = start, xmax = end),
+               ymin = 0, ymax = 1300, fill ="#cccccc", alpha = 0.4, data = fed_holidays) %>%
+  + geom_line(aes(x = date, y = count, color = agency), data = san_bern, size = 0.3) %>%
+  + geom_point(aes(x = date, y = count, color = agency), data = san_bern, size = 1) %>%
+  + geom_vline(xintercept = as.numeric(as.POSIXct("2015-12-02")), linetype = 3) %>%
+  + geom_vline(xintercept = as.numeric(as.POSIXct("2015-11-13")), linetype = 3) %>%
+  + xlab("Date (weekends/holidays marked in gray)") %>%
+  + ylab("Transponder detections per day") %>%
+  + theme_minimal() %>%
+  + scale_color_manual(values = c("#0F3B82","#FF2900"),
+                       labels = c("DHS", "FBI")) %>%
+  + scale_y_continuous(labels = comma) %>%
+  + theme(legend.position = "top",
+          legend.title = element_blank()) %>%
+  + annotate("text", x = as.POSIXct("2015-12-02"), y = 1300, label = "San Bernardino") %>%
+  + annotate("text", x = as.POSIXct("2015-11-13"), y = 1300, label = "Paris")
+```
+
+***
+
+#### Riverside-San Bernadino timeline
+
+```{r, echo=FALSE}
+plot(san_bern_timeline)
+```
+
+***
+
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+# Los Angeles-Long Beach-Anaheim
+la_dhs <- urban_feds_series %>%
+  filter(NAME10 == "Los Angeles--Long Beach--Anaheim, CA" & agency == "dhs") %>%
+  group_by(agency, date) %>%
+  summarise(count = n()) %>%
+  right_join(dates) %>%
+  ungroup() %>%
+  mutate(agency = "dhs")
+la_fbi <- urban_feds_series %>%
+  filter(NAME10 == "Los Angeles--Long Beach--Anaheim, CA" & agency == "fbi") %>%
+  group_by(agency, date) %>%
+  summarise(count = n()) %>%
+  right_join(dates) %>%
+  ungroup() %>%
+  mutate(agency = "fbi")
+la <- bind_rows(la_dhs, la_fbi) %>%
+  mutate(date = as.POSIXct(date) + hrs(12)) # 12-hour offset will plot daily counts at 12 noon on each day
+la[is.na(la)] <- 0
+
+# plot timeline
+la_timeline <- ggplot() %>%
+  + geom_rect(aes(xmin = start, xmax = end),
+               ymin = 0, ymax = 6000, fill = "#cccccc", alpha = 0.4, data = weekends) %>%
+  + geom_rect(aes(xmin = start, xmax = end),
+               ymin = 0, ymax = 6000, fill = "#cccccc", alpha = 0.4, data = fed_holidays) %>%
+  + geom_line(aes(x = date, y = count, color = agency), data = la, size = 0.3) %>%
+  + geom_point(aes(x = date, y = count, color = agency), data = la, size = 1) %>%
+  + geom_vline(xintercept = as.numeric(as.POSIXct("2015-12-02")), linetype = 3) %>%
+  + geom_vline(xintercept = as.numeric(as.POSIXct("2015-11-13")), linetype = 3) %>%
+  + xlab("Date (weekends/holidays marked in gray)") %>%
+  + ylab("Transponder detections per day") %>%
+  + theme_minimal() %>%
+  + scale_color_manual(values=c("#0F3B82", "#FF2900"),
+                       labels=c("DHS", "FBI")) %>%
+  + scale_y_continuous(labels = comma) %>%
+  + theme(legend.position="top",
+          legend.title=element_blank()) %>%
+  + annotate("text", x = as.POSIXct("2015-12-02"), y = 6000, label = "San Bernardino") %>%
+  + annotate("text", x = as.POSIXct("2015-11-13"), y = 6000, label = "Paris")
+```
+
+***
+
+#### Los Angeles-Long Beach-Anaheim timeline
+
+```{r, echo=FALSE}
+plot(la_timeline)
+```
+
+***
+
+
+### Altitude of selected planes above urban areas
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+
+# for DHS Pilatus PC-12s
+dhs_pilatus <- urban_feds_series %>%
+  filter(agency == "dhs" & mfr == "PILATUS")
+
+alt_dhs_pilatus <- ggplot(dhs_pilatus, aes(x=altitude)) %>%
+  + geom_histogram(binwidth=500, fill="#0F3B82") %>%
+  + xlab("Altitude (feet)") %>%
+  + ylab("Transponder detections") %>%
+  + scale_x_continuous(labels = comma, limits = c(0, 30000)) %>%
+  + scale_y_continuous(labels = comma) %>%
+  + theme_minimal()
+
+```
+
+***
+
+#### Altitude of DHS Pilatus PC-12s over urban areas
+
+These are the planes responsible for most of the obvious DHS circles over Los Angeles.
+```{r, echo=FALSE, warning=FALSE}
+plot(alt_dhs_pilatus)
+```
+  
+***  
+
+```{r, results="hide", warning=FALSE, message=FALSE}
+
+# for FBI Cessnas
+fbi_cessna <- urban_feds_series %>%
+  filter(agency == "fbi" & mfr == "CESSNA")
+
+alt_fbi_cessna <- ggplot(fbi_cessna, aes(x=altitude)) %>%
+  + geom_histogram(binwidth = 500, fill = "#FF2900") %>%
+  + xlab("Altitude (feet)") %>%
+  + ylab("Transponder detections") %>%
+  + scale_x_continuous(labels = comma, limits = c(0, 15000)) %>%
+  + scale_y_continuous(labels = comma) %>%
+  + theme_minimal() 
+```
+
+***
+
+#### Altitude of FBI Cessnas over urban areas
+
+```{r, echo=FALSE, warning=FALSE}
+plot(alt_fbi_cessna)
+```
+
+***
+
