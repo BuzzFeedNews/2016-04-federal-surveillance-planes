@@ -735,7 +735,7 @@ datatable(obs_daily2, rownames = FALSE,
 
 ***
 
-### Timelines for urban areas in Southern California, before and after San Bernadino attack
+### Timelines for urban areas in Southern California, before and after San Bernardino attack
 
 ```{r, results="hide", warning=FALSE, message=FALSE}
 
@@ -744,7 +744,7 @@ dates <- urban_feds_series %>%
   select(date) %>%
   unique()
 
-# Riverside-San Bernadino
+# Riverside-San Bernardino
 san_bern_dhs <- urban_feds_series %>%
   filter(NAME10 == "Riverside--San Bernardino, CA" & agency == "dhs") %>%
   group_by(agency, date) %>%
@@ -787,7 +787,7 @@ san_bern_timeline <- ggplot() %>%
 
 ***
 
-#### Riverside-San Bernadino timeline
+#### Riverside-San Bernardino timeline
 
 ```{r, echo=FALSE}
 plot(san_bern_timeline)
