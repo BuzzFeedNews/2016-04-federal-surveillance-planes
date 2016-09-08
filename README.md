@@ -1,6 +1,6 @@
 # Government Surveillance Planes Analysis
 
-This repository contains data and [R](https://www.r-project.org/) code to support the the findings reported in the April 6, 2016 BuzzFeed News article "[Spies In The Skies](https://www.buzzfeed.com/peteraldhous/spies-in-the-skies)."
+This repository contains data and [R](https://www.r-project.org/) code to support the findings reported in the April 6, 2016 BuzzFeed News article "[Spies In The Skies](https://www.buzzfeed.com/peteraldhous/spies-in-the-skies)."
 
 ## Data
 
