@@ -7,12 +7,12 @@ Data and [R](https://www.r-project.org/) code for the analysis supporting this [
 
 ## Data preparation
 
-BuzzFeed News obtained more than four months of aircraft transponder detections from the plane tracking website [Flightradar24](https://www.flightradar24.com), covering August 17 to December 31, 2015 [UTC](http://www.timeanddate.com/time/aboututc.html), containing all data displayed on the site within a bounding box encompassing the continental United States, Alaska, Hawaii and Puerto Rico. Fightradar24 receives data from its network of ground-based receivers, supplemented by a feed from ground radars provided by the Federal Aviation Administration (FAA) with a five-minute delay.
+BuzzFeed News obtained more than four months of aircraft transponder detections from the plane tracking website [Flightradar24](https://www.flightradar24.com), covering August 17 to December 31, 2015 [UTC](http://www.timeanddate.com/time/aboututc.html), containing all data displayed on the site within a bounding box encompassing the continental United States, Alaska, Hawaii and Puerto Rico. Flightradar24 receives data from its network of ground-based receivers, supplemented by a feed from ground radars provided by the Federal Aviation Administration (FAA) with a five-minute delay.
 
 After parsing from the raw files supplied by Flightradar24, the data included the following fields, for each transponder detection:
 
 - `adshex` Unique identifier for each aircraft, corresponding to its "[Mode-S](http://www.skybrary.aero/index.php/Mode_S)" code, in hexademical format.
-- `flight_id` Unique identifier for each "flight segment," in hexadecimal format. A flight segment is a continuous series of transponder detections for one aircraft. There may be more than one segment per flight, if a plane disappears from Flightradar24's coverage for a period --- for example when flying over rural areas with sparse receiver coverage. While being tracked by Fightradar24, surveillance planes were typically detected several times per minute.
+- `flight_id` Unique identifier for each "flight segment," in hexadecimal format. A flight segment is a continuous series of transponder detections for one aircraft. There may be more than one segment per flight, if a plane disappears from Flightradar24's coverage for a period --- for example when flying over rural areas with sparse receiver coverage. While being tracked by Flightradar24, surveillance planes were typically detected several times per minute.
 - `latitude`, `longitude` Geographic location in digital degrees.
 - `altitude` Altitude in feet.
 - `speed` Ground speed in knots.
